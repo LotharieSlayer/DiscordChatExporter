@@ -121,6 +121,21 @@ public abstract class ExportCommandBase : DiscordCommandBase
     }
 
     [CommandOption(
+        "cache-dir",
+        Description = "Cache API responses in this directory and reuse them on subsequent runs. "
+            + "If not specified, no caching is performed."
+    )]
+    public string? CacheDirPath
+    {
+        get;
+        // Handle ~/ in paths on Unix systems
+        // https://github.com/Tyrrrz/DiscordChatExporter/pull/903
+        set => field = value is not null ? Path.GetFullPath(value) : null;
+    }
+
+    protected override string? RequestCacheDirPath => CacheDirPath;
+
+    [CommandOption(
         "dateformat",
         Description = "This option doesn't do anything. Kept for backwards compatibility."
     )]

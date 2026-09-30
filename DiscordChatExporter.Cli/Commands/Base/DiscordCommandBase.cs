@@ -38,8 +38,14 @@ public abstract class DiscordCommandBase : ICommand
     protected DiscordClient Discord =>
         field ??= new DiscordClient(
             Token,
-            ShouldRespectRateLimits ? RateLimitPreference.RespectAll : RateLimitPreference.IgnoreAll
+            ShouldRespectRateLimits
+                ? RateLimitPreference.RespectAll
+                : RateLimitPreference.IgnoreAll,
+            RequestCacheDirPath
         );
+
+    // Overridden by the commands that support response caching
+    protected virtual string? RequestCacheDirPath => null;
 
     public virtual ValueTask ExecuteAsync(IConsole console)
     {

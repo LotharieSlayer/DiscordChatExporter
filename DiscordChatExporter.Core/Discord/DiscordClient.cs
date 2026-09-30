@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,15 +19,53 @@ using PowerKit.Extensions;
 
 namespace DiscordChatExporter.Core.Discord;
 
-public class DiscordClient(
+public partial class DiscordClient(
     string token,
-    RateLimitPreference rateLimitPreference = RateLimitPreference.RespectAll
+    RateLimitPreference rateLimitPreference = RateLimitPreference.RespectAll,
+    string? cacheDirPath = null
 )
 {
     private readonly Uri _baseUri = new("https://discord.com/api/v10/", UriKind.Absolute);
+    private readonly DiscordRequestCache? _requestCache = !string.IsNullOrWhiteSpace(cacheDirPath)
+        ? new DiscordRequestCache(cacheDirPath)
+        : null;
+
     private TokenKind? _resolvedTokenKind;
 
     private async ValueTask<HttpResponseMessage> GetResponseAsync(
+        string url,
+        TokenKind tokenKind,
+        CancellationToken cancellationToken = default
+    )
+    {
+        // Responses that are scoped to the authenticated account rather than to a specific
+        // resource are never cached, because their content differs between credentials.
+        if (_requestCache is not { } cache || IsAccountScoped(url))
+            return await SendRequestAsync(url, tokenKind, cancellationToken);
+
+        // Serve the response from the cache if the same request has already been made
+        if (await cache.TryGetResponseAsync(url, cancellationToken) is { } cached)
+            return cached;
+
+        var response = await SendRequestAsync(url, tokenKind, cancellationToken);
+
+        // Only successful responses are cached. Failure responses are deliberately left out,
+        // because their outcome can differ between attempts: an unauthorized response is used
+        // to resolve the token kind, and caching it would pin the client to the wrong kind.
+        if (response.IsSuccessStatusCode)
+        {
+            var content = await response.Content.ReadAsStringAsync(cancellationToken);
+            await cache.SetResponseAsync(url, content, cancellationToken);
+
+            // Reading the content above consumed the underlying stream, so it has to be
+            // replaced to leave the response in a readable state for the caller.
+            response.Content = new StringContent(content, Encoding.UTF8, "application/json");
+        }
+
+        return response;
+    }
+
+    private async ValueTask<HttpResponseMessage> SendRequestAsync(
         string url,
         TokenKind tokenKind,
         CancellationToken cancellationToken = default
@@ -875,5 +914,28 @@ public class DiscordClient(
             if (count <= 0)
                 yield break;
         }
+    }
+}
+
+public partial class DiscordClient
+{
+    // Paths of the endpoints that describe the authenticated account instead of a specific
+    // resource. Their responses differ between credentials, so they can't be keyed by URL alone.
+    // Every other endpoint is addressed by a resource ID, which makes the URL a sufficient key.
+    // If a new endpoint that isn't addressed by a resource ID is ever introduced, add it here.
+    private static readonly string[] AccountScopedPaths = ["users/@me", "applications/@me"];
+
+    private static bool IsAccountScoped(string url)
+    {
+        // Only the path is relevant, so that a query parameter can't be used to slip past
+        // the check. The match has to end on a path boundary, otherwise a longer path that
+        // merely starts with the same text would be misclassified.
+        var separatorIndex = url.IndexOf('?');
+        var path = separatorIndex >= 0 ? url[..separatorIndex] : url;
+
+        return AccountScopedPaths.Any(p =>
+            path.Equals(p, StringComparison.Ordinal)
+            || path.StartsWith(p + '/', StringComparison.Ordinal)
+        );
     }
 }

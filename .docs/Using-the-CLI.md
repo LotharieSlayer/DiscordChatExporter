@@ -290,3 +290,35 @@ To list all servers accessible by the current account, use the `guilds` command:
 ```console
 ./DiscordChatExporter.Cli guilds -t "mfa.Ifrn" > C:\path\to\output.txt
 ```
+
+## Caching API responses
+
+By default, every run of the app requests all of its data from Discord again. If you export the same chats over and over,
+you can avoid most of that traffic by providing a cache directory with `--cache-dir`. Every successful API response is
+then written to that directory, and any request that has already been made is served from there instead of hitting the
+network:
+
+```console
+./DiscordChatExporter.Cli export -t "mfa.Ifrn" -c 53555 --cache-dir "C:\Discord Cache"
+```
+
+This option is only available on the export commands (`export`, `exportguild`, `exportdm`, and `exportall`). The listing
+commands ignore it, because they issue so few requests that caching them would not be worth it.
+
+It is also separate from `--reuse-media`, which caches downloaded media rather than API responses, so the two can be used
+together.
+
+A few things worth knowing:
+
+- Responses are keyed by request URL, so the cache is not tied to a token. If your token is rotated, the existing entries
+  are still used. Nothing derived from the token is written to the cache directory.
+- Responses that describe the account itself rather than a specific chat or server, such as the list of servers you are
+  in, are never cached. Those differ between accounts, so they are always requested again. Failed requests are never
+  cached either.
+- Cached responses are never invalidated. This is deliberate, as it matches how `--reuse-media` treats already
+  downloaded media, but it does mean that anything which can change over time (server channels, members, and so on)
+  will eventually go stale. Delete the cache directory when you need up-to-date data.
+- Because the cache is not tied to a token, treat the directory as private to a single account. If two different
+  accounts share one, the second may be served entries that the first fetched, including from channels the second
+  would not otherwise be allowed to read.
+- The same directory can be shared by several runs, including concurrent ones.
