@@ -19,6 +19,16 @@ public partial class ExportGuildCommand : ExportCommandBase
     [CommandOption("include-vc", Description = "Include voice channels.")]
     public bool IncludeVoiceChannels { get; set; } = true;
 
+    [CommandOption(
+        "exclude-channels",
+        'x',
+        Description = "Channel or category ID(s) to exclude from the export. "
+            + "Excluding a category excludes all channels inside it."
+    )]
+    public IReadOnlyList<Snowflake> ExcludeChannelIds { get; set; } = [];
+
+    protected override IReadOnlyList<Snowflake> ExcludedChannelIds => ExcludeChannelIds;
+
     public override async ValueTask ExecuteAsync(IConsole console)
     {
         await base.ExecuteAsync(console);

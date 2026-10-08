@@ -6,6 +6,7 @@ using CliFx.Binding;
 using CliFx.Infrastructure;
 using DiscordChatExporter.Cli.Commands.Base;
 using DiscordChatExporter.Cli.Utils.Extensions;
+using DiscordChatExporter.Core.Discord;
 using DiscordChatExporter.Core.Discord.Data;
 using DiscordChatExporter.Core.Discord.Dump;
 using DiscordChatExporter.Core.Exceptions;
@@ -24,6 +25,16 @@ public partial class ExportAllCommand : ExportCommandBase
 
     [CommandOption("include-vc", Description = "Include voice channels.")]
     public bool IncludeVoiceChannels { get; set; } = true;
+
+    [CommandOption(
+        "exclude-channels",
+        'x',
+        Description = "Channel or category ID(s) to exclude from the export. "
+            + "Excluding a category excludes all channels inside it."
+    )]
+    public IReadOnlyList<Snowflake> ExcludeChannelIds { get; set; } = [];
+
+    protected override IReadOnlyList<Snowflake> ExcludedChannelIds => ExcludeChannelIds;
 
     [CommandOption(
         "data-package",

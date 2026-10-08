@@ -178,9 +178,40 @@ public abstract class ExportCommandBase : DiscordCommandBase
     [field: AllowNull, MaybeNull]
     protected ChannelExporter Exporter => field ??= new ChannelExporter(Discord);
 
+    // Overridden by the commands that let the user exclude channels from the export
+    protected virtual IReadOnlyList<Snowflake> ExcludedChannelIds => [];
+
     protected async ValueTask ExportAsync(IConsole console, IReadOnlyList<Channel> channels)
     {
         var cancellationToken = console.RegisterCancellationHandler();
+
+        var excludedChannelIds = new HashSet<Snowflake>(ExcludedChannelIds);
+        var matchedExcludedChannelIds = new HashSet<Snowflake>();
+
+        // A channel is excluded if its own ID, or the ID of one of its ancestors, is listed.
+        // Ancestors cover categories for regular channels and parent channels for threads.
+        bool IsChannelExcluded(Channel channel)
+        {
+            var isExcluded = false;
+
+            foreach (var id in channel.GetParents().Select(p => p.Id).Append(channel.Id))
+            {
+                if (excludedChannelIds.Contains(id))
+                {
+                    matchedExcludedChannelIds.Add(id);
+                    isExcluded = true;
+                }
+            }
+
+            return isExcluded;
+        }
+
+        // Apply the exclusions before unwrapping threads, so that excluded channels
+        // don't have their threads fetched either
+        var filteredChannels =
+            excludedChannelIds.Count > 0
+                ? channels.Where(c => !IsChannelExcluded(c)).ToArray()
+                : channels.ToArray();
 
         // Asset reuse can only be enabled if the download assets option is set
         // https://github.com/Tyrrrz/DiscordChatExporter/issues/425
@@ -204,7 +235,7 @@ public abstract class ExportCommandBase : DiscordCommandBase
         // https://github.com/Tyrrrz/DiscordChatExporter/issues/1549
         var mayExportMultipleChannels =
             // Multiple channels were provided explicitly
-            channels.Count > 1
+            filteredChannels.Length > 1
             // Thread inclusion can add more channels to the export
             || ThreadInclusionMode != ThreadInclusionMode.None;
 
@@ -226,7 +257,7 @@ public abstract class ExportCommandBase : DiscordCommandBase
             );
         }
 
-        var unwrappedChannels = new List<Channel>(channels);
+        var unwrappedChannels = new List<Channel>(filteredChannels);
 
         // Unwrap threads
         if (ThreadInclusionMode != ThreadInclusionMode.None)
@@ -242,7 +273,7 @@ public abstract class ExportCommandBase : DiscordCommandBase
                     {
                         await foreach (
                             var thread in Discord.GetChannelThreadsAsync(
-                                channels,
+                                filteredChannels,
                                 ThreadInclusionMode == ThreadInclusionMode.All,
                                 Before,
                                 After,
@@ -250,6 +281,10 @@ public abstract class ExportCommandBase : DiscordCommandBase
                             )
                         )
                         {
+                            // Threads may be excluded individually, or through their parent channel
+                            if (IsChannelExcluded(thread))
+                                continue;
+
                             unwrappedChannels.Add(thread);
 
                             ctx.Status(Markup.Escape($"Fetched '{thread.GetHierarchicalName()}'."));
@@ -365,6 +400,27 @@ public abstract class ExportCommandBase : DiscordCommandBase
                 await console.Output.WriteAsync($"{channel.GetHierarchicalName()}: ");
                 using (console.WithForegroundColor(ConsoleColor.Cyan))
                     await console.Output.WriteLineAsync(message);
+            }
+
+            await console.Output.WriteLineAsync();
+        }
+
+        // Warn about excluded channel IDs that didn't match anything, which usually
+        // indicates a typo or a channel that isn't part of the current export
+        var unmatchedExcludedChannelIds = excludedChannelIds
+            .Except(matchedExcludedChannelIds)
+            .ToArray();
+        if (unmatchedExcludedChannelIds.Length > 0)
+        {
+            await console.Output.WriteLineAsync();
+
+            using (console.WithForegroundColor(ConsoleColor.Cyan))
+            {
+                await console.Output.WriteLineAsync(
+                    "Note: The following excluded channel ID(s) did not match any channel: "
+                        + string.Join(", ", unmatchedExcludedChannelIds.Select(id => id.ToString()))
+                        + "."
+                );
             }
 
             await console.Output.WriteLineAsync();

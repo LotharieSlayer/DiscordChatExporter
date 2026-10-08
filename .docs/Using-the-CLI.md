@@ -251,6 +251,17 @@ voice channels, use `--include-vc false`.
 ./DiscordChatExporter.Cli exportguild -t "mfa.Ifrn" -g 21814 --include-vc false
 ```
 
+#### Excluding channels
+
+To skip specific channels, use the `-x|--exclude-channels` option and provide one or more channel or category IDs.
+Excluding a category also excludes every channel inside it, and excluding a channel also excludes its threads.
+
+```console
+./DiscordChatExporter.Cli exportguild -t "mfa.Ifrn" -g 21814 --exclude-channels 53555 53099
+```
+
+If one of the provided IDs doesn't match any channel in the export, a note is printed so that typos can be spotted.
+
 ### Export all channels
 
 To export all accessible channels, use the `exportall` command:
@@ -266,6 +277,12 @@ To exclude DMs, add the `--include-dm false` option.
 ```console
 ./DiscordChatExporter.Cli exportall -t "mfa.Ifrn" --include-dm false
 ```
+
+#### Excluding channels
+
+To skip specific channels when exporting everything, use the `-x|--exclude-channels` option, the same way as with
+the `exportguild` command. Excluding a category also excludes every channel inside it, and excluding a channel also
+excludes its threads.
 
 ### List channels in a server
 
