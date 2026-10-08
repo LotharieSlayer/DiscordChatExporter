@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using DiscordChatExporter.Core.Discord;
 using DiscordChatExporter.Core.Discord.Data;
+using DiscordChatExporter.Core.Exceptions;
 using DiscordChatExporter.Core.Exporting.Filtering;
 using DiscordChatExporter.Core.Exporting.Partitioning;
 using PowerKit.Extensions;
@@ -47,6 +48,10 @@ public partial class ExportRequest
 
     public bool IsUtcNormalizationEnabled { get; }
 
+    // Directory containing previously exported messages that can be replayed instead of
+    // being fetched again. Must not overlap with the output directory.
+    public string? ReuseExportDirPath { get; }
+
     public ExportRequest(
         Guild guild,
         Channel channel,
@@ -62,7 +67,8 @@ public partial class ExportRequest
         bool shouldDownloadAssets,
         bool shouldReuseAssets,
         string? locale,
-        bool isUtcNormalizationEnabled
+        bool isUtcNormalizationEnabled,
+        string? reuseExportDirPath = null
     )
     {
         Guild = guild;
@@ -78,6 +84,7 @@ public partial class ExportRequest
         ShouldReuseAssets = shouldReuseAssets;
         Locale = locale;
         IsUtcNormalizationEnabled = isUtcNormalizationEnabled;
+        ReuseExportDirPath = reuseExportDirPath;
 
         OutputFilePath = GetOutputBaseFilePath(Guild, Channel, outputPath, Format, After, Before);
 
@@ -88,11 +95,33 @@ public partial class ExportRequest
             : $"{OutputFilePath}_Files{Path.DirectorySeparatorChar}";
 
         CultureInfo = Locale?.Pipe(CultureInfo.GetCultureInfo);
+
+        // Every partition is written to OutputDirPath, so writing there while reading from the
+        // reuse directory would truncate the very files being replayed.
+        if (
+            !string.IsNullOrWhiteSpace(ReuseExportDirPath)
+            && string.Equals(
+                Path.GetFullPath(OutputDirPath),
+                Path.GetFullPath(ReuseExportDirPath),
+                PathComparison
+            )
+        )
+        {
+            throw new DiscordChatExporterException(
+                $"Output directory '{OutputDirPath}' cannot be used as the --reuse-export directory "
+                    + "because the export would overwrite the messages it is replaying. "
+                    + "Provide a different output directory."
+            );
+        }
     }
 }
 
 public partial class ExportRequest
 {
+    private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+
     public static string GetDefaultOutputFileName(
         Guild guild,
         Channel channel,

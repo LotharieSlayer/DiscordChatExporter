@@ -136,6 +136,21 @@ public abstract class ExportCommandBase : DiscordCommandBase
     protected override string? RequestCacheDirPath => CacheDirPath;
 
     [CommandOption(
+        "reuse-export",
+        Description = "Reuse messages from a previously exported directory instead of fetching them again. "
+            + "Only messages newer than the source export will be downloaded. "
+            + "Can only be used with the JSON format, and cannot be combined with --filter or --reverse. "
+            + "The output directory must be different from this directory."
+    )]
+    public string? ReuseExportDirPath
+    {
+        get;
+        // Handle ~/ in paths on Unix systems
+        // https://github.com/Tyrrrz/DiscordChatExporter/pull/903
+        set => field = value is not null ? Path.GetFullPath(value) : null;
+    }
+
+    [CommandOption(
         "dateformat",
         Description = "This option doesn't do anything. Kept for backwards compatibility."
     )]
@@ -254,6 +269,7 @@ public abstract class ExportCommandBase : DiscordCommandBase
         // Export
         var errorsByChannel = new ConcurrentDictionary<Channel, string>();
         var warningsByChannel = new ConcurrentDictionary<Channel, string>();
+        var noticesByChannel = new ConcurrentDictionary<Channel, string>();
 
         await console.Output.WriteLineAsync($"Exporting {unwrappedChannels.Count} channel(s)...");
         await console
@@ -301,12 +317,14 @@ public abstract class ExportCommandBase : DiscordCommandBase
                                         ShouldDownloadAssets,
                                         ShouldReuseAssets,
                                         Locale,
-                                        IsUtcNormalizationEnabled
+                                        IsUtcNormalizationEnabled,
+                                        ReuseExportDirPath
                                     );
 
                                     await Exporter.ExportChannelAsync(
                                         request,
                                         progress.ToPercentageBased(),
+                                        message => noticesByChannel[channel] = message,
                                         innerCancellationToken
                                     );
                                 }
@@ -330,6 +348,26 @@ public abstract class ExportCommandBase : DiscordCommandBase
             await console.Output.WriteLineAsync(
                 $"Successfully exported {unwrappedChannels.Count - errorsByChannel.Count} channel(s)."
             );
+        }
+
+        // Print notices
+        if (noticesByChannel.Any())
+        {
+            await console.Output.WriteLineAsync();
+
+            using (console.WithForegroundColor(ConsoleColor.Cyan))
+            {
+                await console.Output.WriteLineAsync("Notes for the following channel(s):");
+            }
+
+            foreach (var (channel, message) in noticesByChannel)
+            {
+                await console.Output.WriteAsync($"{channel.GetHierarchicalName()}: ");
+                using (console.WithForegroundColor(ConsoleColor.Cyan))
+                    await console.Output.WriteLineAsync(message);
+            }
+
+            await console.Output.WriteLineAsync();
         }
 
         // Print warnings
@@ -380,8 +418,68 @@ public abstract class ExportCommandBase : DiscordCommandBase
             throw new CommandException("Export failed.");
     }
 
+    // Replaying previously exported messages only makes sense under a narrow set of conditions
+    private void ValidateReuseExportOptions()
+    {
+        if (string.IsNullOrWhiteSpace(ReuseExportDirPath))
+            return;
+
+        // Only the JSON schema round-trips, which is what allows messages to be written back
+        // without reconstructing them
+        if (ExportFormat is not ExportFormat.Json)
+        {
+            throw new CommandException(
+                "Option --reuse-export can only be used with the JSON export format, "
+                    + $"but the export format is '{ExportFormat}'."
+            );
+        }
+
+        // Replayed messages are written as raw JSON, so there's no Message object to filter on
+        if (!ReferenceEquals(MessageFilter, MessageFilter.Null))
+        {
+            throw new CommandException(
+                "Option --reuse-export cannot be combined with --filter, "
+                    + "because messages replayed from a previous export cannot be filtered again."
+            );
+        }
+
+        // The source export may have been created in reverse, and mixing the two directions
+        // would produce an incoherent message order
+        if (IsReverseMessageOrder)
+        {
+            throw new CommandException("Option --reuse-export cannot be combined with --reverse.");
+        }
+
+        // Writing into the directory being replayed from would overwrite the source files
+        if (
+            (
+                Directory.Exists(OutputPath)
+                || string.IsNullOrWhiteSpace(Path.GetExtension(OutputPath))
+            )
+            && string.Equals(
+                NormalizeDirPath(OutputPath),
+                NormalizeDirPath(ReuseExportDirPath),
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal
+            )
+        )
+        {
+            throw new CommandException(
+                "Option --reuse-export cannot point to the same directory as the output path, "
+                    + "because the export would overwrite the messages it is replaying. "
+                    + $"Provided output path: '{OutputPath}'."
+            );
+        }
+    }
+
+    private static string NormalizeDirPath(string path) =>
+        Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
     public override async ValueTask ExecuteAsync(IConsole console)
     {
+        ValidateReuseExportOptions();
+
         // Support Ukraine callout
         if (!IsUkraineSupportMessageDisabled)
         {

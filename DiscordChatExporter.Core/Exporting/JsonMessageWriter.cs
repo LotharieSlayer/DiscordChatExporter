@@ -626,6 +626,17 @@ internal class JsonMessageWriter(Stream stream, ExportContext context)
         await _writer.FlushAsync(cancellationToken);
     }
 
+    public override async ValueTask WriteRawMessageAsync(
+        JsonElement message,
+        CancellationToken cancellationToken = default
+    )
+    {
+        MessagesWritten++;
+
+        message.WriteTo(_writer);
+        await _writer.FlushAsync(cancellationToken);
+    }
+
     public override async ValueTask WritePostambleAsync(
         CancellationToken cancellationToken = default
     )

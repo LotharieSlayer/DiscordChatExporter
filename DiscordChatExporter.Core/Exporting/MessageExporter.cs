@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using DiscordChatExporter.Core.Discord.Data;
@@ -67,6 +68,16 @@ internal partial class MessageExporter(ExportContext context) : IAsyncDisposable
     {
         var writer = await InitializeWriterAsync(cancellationToken);
         await writer.WriteMessageAsync(message, cancellationToken);
+        MessagesExported++;
+    }
+
+    public async ValueTask ExportRawMessageAsync(
+        JsonElement message,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var writer = await InitializeWriterAsync(cancellationToken);
+        await writer.WriteRawMessageAsync(message, cancellationToken);
         MessagesExported++;
     }
 

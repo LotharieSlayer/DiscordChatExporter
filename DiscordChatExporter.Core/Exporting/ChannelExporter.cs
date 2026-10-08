@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using DiscordChatExporter.Core.Discord;
@@ -13,6 +14,7 @@ public class ChannelExporter(DiscordClient discord)
     public async ValueTask ExportChannelAsync(
         ExportRequest request,
         IProgress<Percentage>? progress = null,
+        Action<string>? notice = null,
         CancellationToken cancellationToken = default
     )
     {
@@ -64,23 +66,7 @@ public class ChannelExporter(DiscordClient discord)
             );
         }
 
-        var messages = !request.IsReverseMessageOrder
-            ? discord.GetMessagesAsync(
-                request.Channel.Id,
-                request.After,
-                request.Before,
-                progress,
-                cancellationToken
-            )
-            : discord.GetMessagesInReverseAsync(
-                request.Channel.Id,
-                request.After,
-                request.Before,
-                progress,
-                cancellationToken
-            );
-
-        await foreach (var message in messages)
+        async ValueTask ExportMessageAsync(Message message)
         {
             try
             {
@@ -104,5 +90,112 @@ public class ChannelExporter(DiscordClient discord)
                 );
             }
         }
+
+        // Replay messages from a previous export of the same channel instead of downloading them
+        var reuseSource = await TryLoadReuseSourceAsync(request, notice, cancellationToken);
+
+        if (reuseSource is not null)
+        {
+            await foreach (var rawMessage in reuseSource.EnumerateMessagesAsync(cancellationToken))
+            {
+                await messageExporter.ExportRawMessageAsync(rawMessage, cancellationToken);
+            }
+
+            // Everything up to the last message of the source export has already been replayed,
+            // so only the messages beyond it still need to be fetched.
+            var effectiveAfter =
+                request.After is { } after && after > reuseSource.LastMessageId
+                    ? after
+                    : reuseSource.LastMessageId;
+
+            var hasMessagesToFetch =
+                request.Channel.MayHaveMessagesAfter(effectiveAfter)
+                && (request.Before is not { } before || effectiveAfter < before);
+
+            if (hasMessagesToFetch)
+            {
+                await foreach (
+                    var message in discord.GetMessagesAsync(
+                        request.Channel.Id,
+                        effectiveAfter,
+                        request.Before,
+                        progress,
+                        cancellationToken
+                    )
+                )
+                {
+                    await ExportMessageAsync(message);
+                }
+            }
+
+            return;
+        }
+
+        var messages = !request.IsReverseMessageOrder
+            ? discord.GetMessagesAsync(
+                request.Channel.Id,
+                request.After,
+                request.Before,
+                progress,
+                cancellationToken
+            )
+            : discord.GetMessagesInReverseAsync(
+                request.Channel.Id,
+                request.After,
+                request.Before,
+                progress,
+                cancellationToken
+            );
+
+        await foreach (var message in messages)
+        {
+            await ExportMessageAsync(message);
+        }
+    }
+
+    // Returns the messages available in the given directory, or null if there's nothing to reuse.
+    // Falling back to a regular export is preferred over failing, because a partial or missing
+    // source export is an ordinary situation rather than a user error.
+    private async ValueTask<ExportReuseSource?> TryLoadReuseSourceAsync(
+        ExportRequest request,
+        Action<string>? notice,
+        CancellationToken cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(request.ReuseExportDirPath))
+            return null;
+
+        var source = await ExportReuseSource.TryLoadAsync(request, cancellationToken);
+        if (source is null)
+        {
+            var reason = !Directory.Exists(request.ReuseExportDirPath)
+                ? "the directory does not exist"
+                : $"no exported messages for channel #{request.Channel.Id} were found";
+
+            notice?.Invoke(
+                $"Unable to reuse previous exports from '{request.ReuseExportDirPath}' "
+                    + $"because {reason}; exporting from scratch instead."
+            );
+
+            return null;
+        }
+
+        // The source export may have been limited to a date range that doesn't start where the
+        // current request does, in which case replaying it would silently omit older messages.
+        if (
+            source.ExportedAfter is { } exportedAfter
+            && (request.After is null || exportedAfter > request.After.Value.ToDate())
+        )
+        {
+            notice?.Invoke(
+                $"The previous export in '{request.ReuseExportDirPath}' starts at "
+                    + $"'{exportedAfter:u}', which is later than the requested range; "
+                    + "exporting from scratch instead."
+            );
+
+            return null;
+        }
+
+        return source;
     }
 }

@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using DiscordChatExporter.Core.Discord.Data;
@@ -12,7 +13,7 @@ internal abstract class MessageWriter(Stream stream, ExportContext context) : IA
 
     protected ExportContext Context { get; } = context;
 
-    public long MessagesWritten { get; private set; }
+    public long MessagesWritten { get; protected set; }
 
     public long BytesWritten => Stream.Length;
 
@@ -27,6 +28,16 @@ internal abstract class MessageWriter(Stream stream, ExportContext context) : IA
         MessagesWritten++;
         return default;
     }
+
+    // Writes a message that has already been serialized, which allows a previous export to be
+    // replayed verbatim without reconstructing a Message object or re-resolving its contents.
+    public virtual ValueTask WriteRawMessageAsync(
+        JsonElement message,
+        CancellationToken cancellationToken = default
+    ) =>
+        throw new NotSupportedException(
+            $"Replaying previously exported messages is not supported for {GetType().Name}."
+        );
 
     public virtual ValueTask WritePostambleAsync(CancellationToken cancellationToken = default) =>
         default;

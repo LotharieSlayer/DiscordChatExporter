@@ -279,7 +279,12 @@ public partial class DashboardViewModel : ViewModelBase
                             _settingsService.IsUtcNormalizationEnabled
                         );
 
-                        await exporter.ExportChannelAsync(request, progress, cancellationToken);
+                        await exporter.ExportChannelAsync(
+                            request,
+                            progress,
+                            message => _snackbarManager.Notify(message.TrimEnd('.')),
+                            cancellationToken
+                        );
 
                         Interlocked.Increment(ref successfulExportCount);
                     }

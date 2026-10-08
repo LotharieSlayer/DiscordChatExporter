@@ -306,7 +306,7 @@ This option is only available on the export commands (`export`, `exportguild`, `
 commands ignore it, because they issue so few requests that caching them would not be worth it.
 
 It is also separate from `--reuse-media`, which caches downloaded media rather than API responses, so the two can be used
-together.
+together. To go even further and skip downloading messages altogether, see [Reusing a previous export](#reusing-a-previous-export).
 
 A few things worth knowing:
 
@@ -322,3 +322,35 @@ A few things worth knowing:
   accounts share one, the second may be served entries that the first fetched, including from channels the second
   would not otherwise be allowed to read.
 - The same directory can be shared by several runs, including concurrent ones.
+
+## Reusing a previous export
+
+If you have already exported a chat, the messages in that export can be replayed into a new one instead of being
+downloaded again. Point `--reuse-export` at the directory containing the previous export, and only the messages that
+were sent after it will be fetched:
+
+```console
+./DiscordChatExporter.Cli export -t "mfa.Ifrn" -c 53555 -o "C:\Export2\" --reuse-export "C:\Export1\"
+```
+
+This is most useful for keeping a long-lived export up to date: the first run downloads everything, and every run
+after that only downloads what's new. Combine it with `--cache-dir` to also skip the handful of metadata requests that
+are still made.
+
+A few things worth knowing:
+
+- The source directory is only read from, never written to, which is why the output directory has to be different.
+  Use a separate folder for the new export.
+- Only the JSON format is supported. The other formats do not round-trip, so replaying them verbatim would produce
+  invalid output.
+- `--filter` and `--reverse` cannot be combined with this option. Replayed messages are written exactly as they were
+  exported, so there is no message object left to filter, and the replay is always in chronological order. Use
+  `--after` or `--before` to select a narrower range instead.
+- `--after` and `--before` are still honored: messages outside of the requested range are dropped from the replay,
+  and only the portion of the range that isn't covered by the source export is fetched.
+- When `--media` is used, the replayed messages keep the asset paths written by the previous export. Export to a
+  folder at the same depth as the original one and keep using the same `--media-dir`, otherwise those references will
+  point at the wrong place.
+- If the directory does not exist, or contains no export for the given chat, the command falls back to a regular
+  export and prints a note. The same happens when the source export started later than the requested `--after` range,
+  because replaying it would silently leave out older messages.
