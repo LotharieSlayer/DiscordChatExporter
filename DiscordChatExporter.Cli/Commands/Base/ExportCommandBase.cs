@@ -373,6 +373,16 @@ public abstract class ExportCommandBase : DiscordCommandBase
                         {
                             errorsByChannel[channel] = ex.Message;
                         }
+                        // Anything else (e.g. an error that escaped the API layer) is also
+                        // recorded and the export continues with the remaining channels.
+                        // A single failing channel must not abort a run that may span thousands.
+                        catch (Exception ex)
+                            when (ex is not OperationCanceledException
+                                && ex is not DiscordChatExporterException { IsFatal: true }
+                            )
+                        {
+                            errorsByChannel[channel] = ex.Message;
+                        }
                     }
                 );
             });
