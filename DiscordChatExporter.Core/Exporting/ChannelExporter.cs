@@ -180,6 +180,17 @@ public class ChannelExporter(DiscordClient discord)
             return null;
         }
 
+        // Partially written source files are recovered on a best-effort basis, so tell the user
+        // when that happened rather than letting it pass silently
+        if (source.WasRecovered)
+        {
+            notice?.Invoke(
+                $"Recovered messages from a partially written export in "
+                    + $"'{request.ReuseExportDirPath}'; messages that were never written in full "
+                    + "will be downloaded again."
+            );
+        }
+
         // The source export may have been limited to a date range that doesn't start where the
         // current request does, in which case replaying it would silently omit older messages.
         if (

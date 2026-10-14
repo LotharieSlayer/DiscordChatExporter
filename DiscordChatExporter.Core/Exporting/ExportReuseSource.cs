@@ -27,7 +27,8 @@ internal sealed class ExportReuseSource
         IReadOnlyList<SourcePartition> partitions,
         Snowflake lastMessageId,
         long messageCount,
-        DateTimeOffset? exportedAfter
+        DateTimeOffset? exportedAfter,
+        bool wasRecovered
     )
     {
         _request = request;
@@ -35,6 +36,7 @@ internal sealed class ExportReuseSource
         LastMessageId = lastMessageId;
         MessageCount = messageCount;
         ExportedAfter = exportedAfter;
+        WasRecovered = wasRecovered;
     }
 
     // The newest message available in the source export; everything beyond it must be fetched
@@ -45,13 +47,19 @@ internal sealed class ExportReuseSource
     // The 'after' boundary that the source export was created with, if any
     public DateTimeOffset? ExportedAfter { get; }
 
+    // Whether any of the source files were only partially written (e.g. because a previous
+    // export was interrupted) and had to be recovered
+    public bool WasRecovered { get; }
+
     public async IAsyncEnumerable<JsonElement> EnumerateMessagesAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default
     )
     {
         foreach (var partition in _partitions)
         {
-            var document = await ParseAsync(partition.FilePath, cancellationToken);
+            var (document, _) = await ParseTolerantAsync(partition.FilePath, cancellationToken);
+            if (document is null)
+                continue;
 
             try
             {
@@ -115,7 +123,7 @@ internal sealed class ExportReuseSource
         if (string.IsNullOrWhiteSpace(dirPath) || !Directory.Exists(dirPath))
             return null;
 
-        var allFilePaths = Directory.EnumerateFiles(dirPath, "*.json").ToArray();
+        var allFilePaths = EnumerateExportFiles(dirPath);
         if (allFilePaths.Length <= 0)
             return null;
 
@@ -134,21 +142,28 @@ internal sealed class ExportReuseSource
         var lastMessageId = Snowflake.Zero;
         long messageCount = 0;
         DateTimeOffset? exportedAfter = null;
+        var wasRecovered = false;
 
         foreach (var filePath in candidateFilePaths)
         {
-            JsonDocument document;
+            JsonDocument? document;
+            bool recovered;
 
             try
             {
-                document = await ParseAsync(filePath, cancellationToken);
+                (document, recovered) = await ParseTolerantAsync(filePath, cancellationToken);
             }
             // The channel an unreadable file belongs to cannot be determined, and silently
             // skipping it could leave a hole in the middle of the export
-            catch (Exception ex) when (ex is JsonException or IOException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 return null;
             }
+
+            // A file that can't be interpreted as an export at all is treated the same way,
+            // for the same reason
+            if (document is null)
+                return null;
 
             using (document)
             {
@@ -198,6 +213,8 @@ internal sealed class ExportReuseSource
 
                 if (maxMessageId.CompareTo(lastMessageId) > 0)
                     lastMessageId = maxMessageId;
+
+                wasRecovered |= recovered;
             }
         }
 
@@ -209,17 +226,148 @@ internal sealed class ExportReuseSource
             partitions.OrderBy(p => p.MinMessageId).ToArray(),
             lastMessageId,
             messageCount,
-            exportedAfter
+            exportedAfter,
+            wasRecovered
         );
     }
 
-    private static async ValueTask<JsonDocument> ParseAsync(
+    // Considers both complete exports and in-progress ones (written with the '.partial' suffix).
+    // When both exist for the same file, the in-progress one represents the newer attempt and
+    // therefore supersedes the complete one.
+    private static string[] EnumerateExportFiles(string dirPath)
+    {
+        var filePaths = Directory
+            .EnumerateFiles(dirPath)
+            .Where(f =>
+                f.EndsWith(".json", StringComparison.Ordinal)
+                || f.EndsWith(
+                    ".json" + MessageExporter.PartialFileExtension,
+                    StringComparison.Ordinal
+                )
+            )
+            .ToArray();
+
+        var partialBasePaths = filePaths
+            .Where(f => f.EndsWith(MessageExporter.PartialFileExtension, StringComparison.Ordinal))
+            .Select(f => f[..^MessageExporter.PartialFileExtension.Length])
+            .ToHashSet(StringComparer.Ordinal);
+
+        return filePaths.Where(f => !partialBasePaths.Contains(f)).ToArray();
+    }
+
+    // Reads an export file that may have been cut off halfway (e.g. because the process was
+    // terminated). Messages that were written in full are preserved and the incomplete tail is
+    // discarded. Returns a null document if the file can't be interpreted as an export at all.
+    private static async ValueTask<(JsonDocument? Document, bool WasRecovered)> ParseTolerantAsync(
         string filePath,
         CancellationToken cancellationToken
     )
     {
-        await using var stream = File.OpenRead(filePath);
-        return await JsonDocument.ParseAsync(stream, default, cancellationToken);
+        var bytes = await File.ReadAllBytesAsync(filePath, cancellationToken);
+
+        // Fast path: the file was written in full
+        try
+        {
+            return (JsonDocument.Parse(bytes), false);
+        }
+        catch (JsonException)
+        {
+            // Fall through to recovery
+        }
+
+        // Rewind to just past the last message that was written in full, then close the
+        // message array and the root object to form valid JSON again
+        if (TryRecoverTruncatedJson(bytes) is not { } recoveredBytes)
+            return (null, false);
+
+        try
+        {
+            return (JsonDocument.Parse(recoveredBytes), true);
+        }
+        catch (JsonException)
+        {
+            return (null, false);
+        }
+    }
+
+    // Rewinds a truncated export file to just past the last message that was written in full,
+    // then closes the message array and the root object so that the result is valid JSON.
+    // Returns null if the input can't be recovered (e.g. it is not a DiscordChatExporter
+    // payload, or it did not contain a single complete message).
+    internal static byte[]? TryRecoverTruncatedJson(byte[] bytes)
+    {
+        if (FindLastCompleteMessageEnd(bytes) is not { } lastMessageEnd)
+            return null;
+
+        var recoveredBytes = new byte[lastMessageEnd + 2];
+        bytes.AsSpan(0, lastMessageEnd).CopyTo(recoveredBytes);
+        recoveredBytes[^2] = (byte)']';
+        recoveredBytes[^1] = (byte)'}';
+
+        return recoveredBytes;
+    }
+
+    // Scans the 'messages' array and returns the byte offset just past the last message element
+    // that was written in full, or null if the array could not be reached or contained no
+    // complete message. The input may be truncated: scanning stops at the first structural error.
+    private static int? FindLastCompleteMessageEnd(ReadOnlySpan<byte> bytes)
+    {
+        var reader = new Utf8JsonReader(bytes, isFinalBlock: true, default);
+
+        var depth = 0;
+        var isInMessagesArray = false;
+        string? currentPropertyName = null;
+        int? lastMessageEnd = null;
+
+        try
+        {
+            while (reader.Read())
+            {
+                switch (reader.TokenType)
+                {
+                    case JsonTokenType.PropertyName:
+                        currentPropertyName = reader.GetString();
+                        break;
+
+                    case JsonTokenType.StartObject:
+                        depth++;
+                        currentPropertyName = null;
+                        break;
+
+                    case JsonTokenType.StartArray:
+                        depth++;
+                        // The 'messages' array sits directly inside the root object
+                        if (currentPropertyName == "messages" && depth == 2)
+                            isInMessagesArray = true;
+                        currentPropertyName = null;
+                        break;
+
+                    case JsonTokenType.EndObject:
+                        depth--;
+                        // Each element of the 'messages' array is an object, so seeing the depth
+                        // drop back to that of the array marks a fully written message
+                        if (isInMessagesArray && depth == 2)
+                            lastMessageEnd = (int)reader.BytesConsumed;
+                        currentPropertyName = null;
+                        break;
+
+                    case JsonTokenType.EndArray:
+                        depth--;
+                        if (isInMessagesArray && depth < 2)
+                            isInMessagesArray = false;
+                        currentPropertyName = null;
+                        break;
+
+                    default:
+                        currentPropertyName = null;
+                        break;
+                }
+            }
+        }
+        // The truncation point was reached; whatever was recorded up to here is valid
+        catch (JsonException) { }
+
+        return lastMessageEnd;
     }
 
     private static Snowflake? ReadMessageId(JsonElement message) =>
