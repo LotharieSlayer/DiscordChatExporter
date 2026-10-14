@@ -84,7 +84,10 @@ public partial class DiscordClient(
 
                 var response = await Http.Client.SendAsync(
                     request,
-                    HttpCompletionOption.ResponseHeadersRead,
+                    // The response body is read into memory as part of the request, so that a
+                    // truncated or interrupted body fails inside the retry policy instead of
+                    // surfacing as a JSON parsing error later on.
+                    HttpCompletionOption.ResponseContentRead,
                     innerCancellationToken
                 );
 

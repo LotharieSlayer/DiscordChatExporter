@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using AsyncKeyedLock;
@@ -30,13 +31,20 @@ internal partial class DiscordRequestCache(string dirPath)
 
         try
         {
+            var content = await File.ReadAllTextAsync(filePath, cancellationToken);
+
+            // Older versions could cache a partially received response body, which would then
+            // fail every subsequent run until the entry was cleared. Such an entry is discarded
+            // and treated as a cache miss, so that the response is fetched from the server again.
+            if (!IsValidJson(content))
+            {
+                TryDeleteFile(filePath);
+                return null;
+            }
+
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new StringContent(
-                    await File.ReadAllTextAsync(filePath, cancellationToken),
-                    Encoding.UTF8,
-                    "application/json"
-                ),
+                Content = new StringContent(content, Encoding.UTF8, "application/json"),
             };
         }
         // A cache entry that can't be read is no reason to fail the request, so it is
@@ -53,6 +61,11 @@ internal partial class DiscordRequestCache(string dirPath)
         CancellationToken cancellationToken = default
     )
     {
+        // A partially received response body must never be cached, because the corrupt entry
+        // would fail every subsequent run until it's cleared.
+        if (!IsValidJson(content))
+            return;
+
         var filePath = GetFilePath(dirPath, url);
         string? tempFilePath = null;
 
@@ -89,6 +102,19 @@ internal partial class DiscordRequestCache(string dirPath)
 
 internal partial class DiscordRequestCache
 {
+    private static bool IsValidJson(string content)
+    {
+        try
+        {
+            using var _ = JsonDocument.Parse(content);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
     private static string GetFilePath(string dirPath, string url)
     {
         var fileName =

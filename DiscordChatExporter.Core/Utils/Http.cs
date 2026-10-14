@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -26,9 +27,12 @@ public static class Http
         exception
             .GetSelfAndDescendants()
             .Any(ex =>
-                ex is TimeoutException or SocketException or AuthenticationException
+                // I/O failures cover responses that were truncated or interrupted mid-transfer
+                ex is TimeoutException or SocketException or AuthenticationException or IOException
+                // A missing status code indicates a transport-level failure (e.g. the connection
+                // was reset before a response could be produced), which is always retryable
                 || ex is HttpRequestException hrex
-                    && IsRetryableStatusCode(hrex.StatusCode ?? HttpStatusCode.OK)
+                    && (hrex.StatusCode is null || IsRetryableStatusCode(hrex.StatusCode.Value))
             );
 
     public static ResiliencePipeline ResiliencePipeline { get; } =
