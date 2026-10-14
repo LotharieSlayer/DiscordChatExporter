@@ -8,6 +8,7 @@ using System.Security.Authentication;
 using System.Threading.Tasks;
 using Polly;
 using Polly.Retry;
+using Polly.Timeout;
 using PowerKit.Extensions;
 
 namespace DiscordChatExporter.Core.Utils;
@@ -15,6 +16,18 @@ namespace DiscordChatExporter.Core.Utils;
 public static class Http
 {
     public static HttpClient Client { get; } = new();
+
+    // Long-running, unattended exports should be resilient to Discord being unavailable for
+    // extended periods of time, so failed requests are retried at a fixed interval for up to
+    // two hours before giving up.
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromMinutes(5);
+
+    // 24 retries at 5 minutes each adds up to roughly two hours of retrying
+    private const int MaxApiRetryCount = 24;
+
+    // A single attempt is abandoned if it takes longer than this, so that a hung connection
+    // is retried rather than blocking the export indefinitely.
+    private static readonly TimeSpan AttemptTimeout = TimeSpan.FromMinutes(3);
 
     private static bool IsRetryableStatusCode(HttpStatusCode statusCode) =>
         statusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.RequestTimeout
@@ -27,8 +40,14 @@ public static class Http
         exception
             .GetSelfAndDescendants()
             .Any(ex =>
-                // I/O failures cover responses that were truncated or interrupted mid-transfer
-                ex is TimeoutException or SocketException or AuthenticationException or IOException
+                // I/O failures cover responses that were truncated or interrupted mid-transfer,
+                // while the rejected timeout comes from the per-attempt timeout policy below
+                ex
+                    is TimeoutException
+                        or TimeoutRejectedException
+                        or SocketException
+                        or AuthenticationException
+                        or IOException
                 // A missing status code indicates a transport-level failure (e.g. the connection
                 // was reset before a response could be produced), which is always retryable
                 || ex is HttpRequestException hrex
@@ -56,7 +75,7 @@ public static class Http
                     ShouldHandle = new PredicateBuilder<HttpResponseMessage>()
                         .Handle<Exception>(IsRetryableException)
                         .HandleResult(m => IsRetryableStatusCode(m.StatusCode)),
-                    MaxRetryAttempts = 8,
+                    MaxRetryAttempts = MaxApiRetryCount,
                     DelayGenerator = args =>
                     {
                         // If rate-limited, use retry-after header as the guide.
@@ -69,11 +88,12 @@ public static class Http
                             );
                         }
 
-                        return ValueTask.FromResult<TimeSpan?>(
-                            TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber) + 1)
-                        );
+                        return ValueTask.FromResult<TimeSpan?>(RetryDelay);
                     },
                 }
             )
+            // The timeout is applied after the retry strategy, which means each attempt gets
+            // its own timeout instead of the whole retry loop sharing a single one.
+            .AddTimeout(AttemptTimeout)
             .Build();
 }
