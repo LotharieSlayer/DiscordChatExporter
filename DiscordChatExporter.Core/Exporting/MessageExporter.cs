@@ -9,8 +9,14 @@ namespace DiscordChatExporter.Core.Exporting;
 
 internal partial class MessageExporter(ExportContext context) : IAsyncDisposable
 {
+    // Partitions are written under this suffix and only renamed once they are fully written,
+    // so that an export interrupted halfway can be told apart from a complete one.
+    public const string PartialFileExtension = ".partial";
+
     private int _partitionIndex;
     private MessageWriter? _writer;
+    private string? _partialFilePath;
+    private string? _committedFilePath;
 
     public long MessagesExported { get; private set; }
 
@@ -38,7 +44,10 @@ internal partial class MessageExporter(ExportContext context) : IAsyncDisposable
         Directory.CreateDirectory(context.Request.OutputDirPath);
         var filePath = GetPartitionFilePath(context.Request.OutputFilePath, _partitionIndex);
 
-        var writer = CreateMessageWriter(filePath, context.Request.Format, context);
+        _committedFilePath = filePath;
+        _partialFilePath = filePath + PartialFileExtension;
+
+        var writer = CreateMessageWriter(_partialFilePath, context.Request.Format, context);
         await writer.WritePreambleAsync(cancellationToken);
 
         return _writer = writer;
@@ -46,19 +55,28 @@ internal partial class MessageExporter(ExportContext context) : IAsyncDisposable
 
     private async ValueTask UninitializeWriterAsync(CancellationToken cancellationToken = default)
     {
-        if (_writer is not null)
+        if (_writer is not { } writer)
+            return;
+
+        _writer = null;
+
+        try
         {
-            try
-            {
-                await _writer.WritePostambleAsync(cancellationToken);
-            }
-            // Writer must be disposed, even if it fails to write the postamble
-            finally
-            {
-                await _writer.DisposeAsync();
-                _writer = null;
-            }
+            await writer.WritePostambleAsync(cancellationToken);
         }
+        // Writer must be disposed, even if it fails to write the postamble
+        finally
+        {
+            await writer.DisposeAsync();
+        }
+
+        // The file is only renamed into place once it has been written in full. If the postamble
+        // or the flush above throws, the exception propagates and the file stays as '.partial'.
+        if (_partialFilePath is { } partialFilePath && _committedFilePath is { } committedFilePath)
+            File.Move(partialFilePath, committedFilePath, true);
+
+        _partialFilePath = null;
+        _committedFilePath = null;
     }
 
     public async ValueTask ExportMessageAsync(
