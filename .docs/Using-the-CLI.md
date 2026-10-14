@@ -371,3 +371,41 @@ A few things worth knowing:
 - If the directory does not exist, or contains no export for the given chat, the command falls back to a regular
   export and prints a note. The same happens when the source export started later than the requested `--after` range,
   because replaying it would silently leave out older messages.
+- Exports that were interrupted halfway are still usable. Files that are being written are kept with a `.partial`
+  suffix until they are complete, and this option will recover the messages that were written in full before the
+  interruption, skip the incomplete tail, and print a note. The messages that were lost this way are downloaded again
+  on the next run, so pointing `--reuse-export` at the directory of an interrupted export is a valid way to resume it.
+
+## Retrying failed channels
+
+When exporting many channels, a single channel can fail without aborting the whole run. If at least one channel fails,
+the list of failures is written to a file so that they can be retried later without redoing the channels that already
+succeeded:
+
+```console
+./DiscordChatExporter.Cli exportguild -t "mfa.Ifrn" -g 53555 -o "C:\Export\"
+./DiscordChatExporter.Cli exportguild -t "mfa.Ifrn" -g 53555 -o "C:\Export\" --retry-failed "C:\Export\.discordchatexporter-failures.txt"
+```
+
+The failure log is written to `.discordchatexporter-failures.txt` in the output directory. Use `--failure-log` to write
+it somewhere else:
+
+```console
+./DiscordChatExporter.Cli exportguild -t "mfa.Ifrn" -g 53555 -o "C:\Export\" --failure-log "C:\Failures.txt"
+```
+
+Combine `--retry-failed` with `--reuse-export` pointing at the directory from the first run, so that the channels that
+succeeded are skipped entirely instead of being downloaded again:
+
+```console
+./DiscordChatExporter.Cli exportguild -t "mfa.Ifrn" -g 53555 -o "C:\Export2\" --reuse-export "C:\Export\" --retry-failed "C:\Export\.discordchatexporter-failures.txt"
+```
+
+A few things worth knowing:
+
+- The failure log is a plain text file. Lines that start with `#` are comments, and each remaining line has the form
+  `<channel ID><tab><server ID><tab><reason>`.
+- `--retry-failed` fails if the file does not exist, does not list any channels, or none of the listed channels are
+  part of the current export. This usually means a typo in the path or that the wrong server was selected.
+- The failure log is written to a temporary file first and then moved into place, so an interrupted run will not
+  corrupt a log from a previous run.

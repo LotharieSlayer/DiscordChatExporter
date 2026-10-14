@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using CliFx;
 using CliFx.Binding;
@@ -151,6 +152,34 @@ public abstract class ExportCommandBase : DiscordCommandBase
     }
 
     [CommandOption(
+        "failure-log",
+        Description = "Write the list of channels that failed to export to this file. "
+            + "If not specified, the list is written to '.discordchatexporter-failures.txt' "
+            + "in the output directory. Only written when at least one channel fails."
+    )]
+    public string? FailureLogFilePath
+    {
+        get;
+        // Handle ~/ in paths on Unix systems
+        // https://github.com/Tyrrrz/DiscordChatExporter/pull/903
+        set => field = value is not null ? Path.GetFullPath(value) : null;
+    }
+
+    [CommandOption(
+        "retry-failed",
+        Description = "Only export the channels listed in the failure log produced by a previous "
+            + "run (see --failure-log). Intended to be combined with --reuse-export, so that "
+            + "channels that succeeded last time are skipped."
+    )]
+    public string? RetryFailedFilePath
+    {
+        get;
+        // Handle ~/ in paths on Unix systems
+        // https://github.com/Tyrrrz/DiscordChatExporter/pull/903
+        set => field = value is not null ? Path.GetFullPath(value) : null;
+    }
+
+    [CommandOption(
         "dateformat",
         Description = "This option doesn't do anything. Kept for backwards compatibility."
     )]
@@ -185,6 +214,39 @@ public abstract class ExportCommandBase : DiscordCommandBase
     {
         var cancellationToken = console.RegisterCancellationHandler();
 
+        // When retrying, restrict the export to the channels that failed during a previous run.
+        // Exclusions, thread expansion, and output validation all then apply to that subset.
+        var selectedChannels = channels;
+        if (!string.IsNullOrWhiteSpace(RetryFailedFilePath))
+        {
+            if (!File.Exists(RetryFailedFilePath))
+            {
+                throw new CommandException(
+                    $"Failure log file '{RetryFailedFilePath}' does not exist."
+                );
+            }
+
+            var retryChannelIds = ReadFailureLog(RetryFailedFilePath);
+            if (retryChannelIds.Count <= 0)
+            {
+                throw new CommandException(
+                    $"Failure log file '{RetryFailedFilePath}' does not list any channels."
+                );
+            }
+
+            selectedChannels = selectedChannels
+                .Where(c => retryChannelIds.Contains(c.Id))
+                .ToArray();
+
+            if (selectedChannels.Count <= 0)
+            {
+                throw new CommandException(
+                    $"None of the channels listed in failure log '{RetryFailedFilePath}' "
+                        + "are part of this export."
+                );
+            }
+        }
+
         var excludedChannelIds = new HashSet<Snowflake>(ExcludedChannelIds);
         var matchedExcludedChannelIds = new HashSet<Snowflake>();
 
@@ -210,8 +272,8 @@ public abstract class ExportCommandBase : DiscordCommandBase
         // don't have their threads fetched either
         var filteredChannels =
             excludedChannelIds.Count > 0
-                ? channels.Where(c => !IsChannelExcluded(c)).ToArray()
-                : channels.ToArray();
+                ? selectedChannels.Where(c => !IsChannelExcluded(c)).ToArray()
+                : selectedChannels.ToArray();
 
         // Asset reuse can only be enabled if the download assets option is set
         // https://github.com/Tyrrrz/DiscordChatExporter/issues/425
@@ -478,10 +540,121 @@ public abstract class ExportCommandBase : DiscordCommandBase
             await console.Error.WriteLineAsync();
         }
 
+        // Persist the failed channels so that they can be retried in a later run, potentially
+        // skipping the ones that succeeded by combining --retry-failed with --reuse-export
+        if (errorsByChannel.Count > 0)
+        {
+            var failureLogFilePath = !string.IsNullOrWhiteSpace(FailureLogFilePath)
+                ? FailureLogFilePath
+                : GetDefaultFailureLogPath();
+
+            try
+            {
+                await WriteFailureLogAsync(
+                    failureLogFilePath,
+                    errorsByChannel.Select(kvp => (kvp.Key.Id, kvp.Key.GuildId, kvp.Value)),
+                    cancellationToken
+                );
+
+                await console.Output.WriteLineAsync();
+                using (console.WithForegroundColor(ConsoleColor.Yellow))
+                {
+                    await console.Output.WriteLineAsync(
+                        $"Wrote the list of failed channels to '{failureLogFilePath}'."
+                    );
+                    await console.Output.WriteLineAsync(
+                        $"Re-run with --retry-failed \"{failureLogFilePath}\" to retry them."
+                    );
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                await console.Error.WriteLineAsync(
+                    $"Failed to write the failure log to '{failureLogFilePath}': {ex.Message}"
+                );
+            }
+        }
+
         // Fail the command only if ALL channels failed to export.
         // If only some channels failed to export, it's okay.
         if (errorsByChannel.Count >= unwrappedChannels.Count)
             throw new CommandException("Export failed.");
+    }
+
+    // Returns the file the failure log is written to when --failure-log is not specified
+    private string GetDefaultFailureLogPath()
+    {
+        var outputDir =
+            Directory.Exists(OutputPath) || Path.EndsInDirectorySeparator(OutputPath)
+                ? OutputPath
+                : Path.GetDirectoryName(OutputPath);
+
+        if (string.IsNullOrWhiteSpace(outputDir))
+            outputDir = Directory.GetCurrentDirectory();
+
+        return Path.Combine(outputDir, ".discordchatexporter-failures.txt");
+    }
+
+    // Reads a failure log produced by a previous run and returns the channel IDs it lists.
+    // Lines that are blank or start with '#' are comments and are ignored.
+    private static IReadOnlyList<Snowflake> ReadFailureLog(string filePath)
+    {
+        var channelIds = new HashSet<Snowflake>();
+
+        foreach (var line in File.ReadLines(filePath))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length <= 0 || trimmed.StartsWith('#'))
+                continue;
+
+            var channelIdText = trimmed.Split('\t', 3)[0];
+            if (Snowflake.TryParse(channelIdText) is { } channelId)
+                channelIds.Add(channelId);
+        }
+
+        return channelIds.ToArray();
+    }
+
+    // Writes a tab-separated failure log. Written to a temporary file first, so that an
+    // interrupted write doesn't corrupt a failure log from a previous run.
+    private static async Task WriteFailureLogAsync(
+        string filePath,
+        IEnumerable<(Snowflake ChannelId, Snowflake GuildId, string Reason)> failures,
+        CancellationToken cancellationToken
+    )
+    {
+        var lines = new List<string>
+        {
+            "# DiscordChatExporter export failures",
+            $"# {DateTimeOffset.Now:u}",
+            "# channelId\tguildId\treason",
+        };
+
+        lines.AddRange(
+            failures
+                .OrderBy(f => f.ChannelId.Value)
+                .Select(f => $"{f.ChannelId}\t{f.GuildId}\t{SanitizeFailureReason(f.Reason)}")
+        );
+
+        var dirPath = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrWhiteSpace(dirPath))
+            Directory.CreateDirectory(dirPath);
+
+        var tempFilePath = filePath + ".tmp";
+        await File.WriteAllLinesAsync(tempFilePath, lines, cancellationToken);
+        File.Move(tempFilePath, filePath, true);
+    }
+
+    // Failure reasons are free-form and may contain newlines or tabs, which would break the
+    // tab-separated format, so collapse them into spaces and cap the length
+    private static string SanitizeFailureReason(string reason)
+    {
+        var sanitized = new string(
+            reason.Select(c => c is '\r' or '\n' or '\t' ? ' ' : c).ToArray()
+        ).Trim();
+
+        const int maxLength = 500;
+        return sanitized.Length > maxLength ? sanitized[..maxLength] + "..." : sanitized;
     }
 
     // Replaying previously exported messages only makes sense under a narrow set of conditions
@@ -545,6 +718,13 @@ public abstract class ExportCommandBase : DiscordCommandBase
     public override async ValueTask ExecuteAsync(IConsole console)
     {
         ValidateReuseExportOptions();
+
+        // Fail fast on a missing failure log, before doing potentially expensive work such as
+        // resolving channels or fetching threads
+        if (!string.IsNullOrWhiteSpace(RetryFailedFilePath) && !File.Exists(RetryFailedFilePath))
+        {
+            throw new CommandException($"Failure log file '{RetryFailedFilePath}' does not exist.");
+        }
 
         // Support Ukraine callout
         if (!IsUkraineSupportMessageDisabled)
